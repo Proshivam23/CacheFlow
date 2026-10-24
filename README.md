@@ -6,7 +6,7 @@ CacheFlow is a NestJS API gateway that forwards requests to registered upstream 
 
 - **API-key management:** create, list, and revoke keys through admin-protected endpoints. Raw keys are returned only at creation; only SHA-256 hashes are stored.
 - **Response caching:** cache successful GET responses with a configurable TTL. Cache keys include the request method, path, sorted query parameters, and authenticated API-key ID.
-- **Rate limiting:** atomic Redis Lua counters enforce a fixed window per API key and return HTTP 429 when the limit is exceeded.
+- **Rate limiting:** atomic Redis Lua counters enforce each API key's stored limit within a configurable fixed window and return HTTP 429 when the limit is exceeded.
 - **Upstream proxying:** route requests by service UUID, preserve the upstream base path and incoming query string, and enforce a 10-second fetch timeout.
 - **Metrics:** inspect upstream request counts, average latency, cache hits, misses, and hit ratio as JSON.
 - **Health checks:** check Redis and PostgreSQL connectivity from one endpoint.
@@ -183,6 +183,33 @@ Invoke-RestMethod -Method Delete `
 
 Save the returned `apiKey` securely if you need it later; listing keys does not return the raw secret. The creation body accepts `name` (string, at most 100 characters) and an optional positive integer `rateLimit` (defaults to `DEFAULT_RATE_LIMIT`, or 100 when unset).
 
+### Configure rate limits
+
+Set `DEFAULT_RATE_LIMIT` to the limit assigned to new keys when the creation request omits `rateLimit`. Set `DEFAULT_RATE_WINDOW_SECONDS` to the gateway's window duration. For example:
+
+```dotenv
+DEFAULT_RATE_LIMIT=250
+DEFAULT_RATE_WINDOW_SECONDS=90
+```
+
+With this configuration, creating a key with `{"name":"standard-client"}` stores a limit of 250 requests per 90 seconds. Creating one with `{"name":"small-client","rateLimit":20}` stores a limit of 20 requests per 90 seconds. Both values must be positive integers; an explicit `rateLimit` of `null`, zero, or a fractional number is rejected.
+
+Restart the application after changing environment settings. Changing `DEFAULT_RATE_LIMIT` does not modify existing keys. To change an existing key's limit, edit its `ApiKey.rateLimit` in Prisma Studio; there is currently no HTTP endpoint for updating it. A changed window duration applies when Redis creates the next counter; an existing counter retains its expiry.
+
+The window starts with the first counted request. All gateway paths and HTTP methods share the same counter for an authenticated API-key ID, including requests served from cache. Once the quota is exhausted, responses contain HTTP 429 and a JSON body such as:
+
+```json
+{
+  "statusCode": 429,
+  "message": "Too many requests",
+  "limit": 20,
+  "remaining": 0,
+  "retryAfterSeconds": 42
+}
+```
+
+For routes using `RateLimiterGuard`, `@RateLimit()` enables the defaults. An explicit decorator `limit` takes precedence over the authenticated key's limit, which takes precedence over `DEFAULT_RATE_LIMIT`. An explicit `windowSeconds` takes precedence over `DEFAULT_RATE_WINDOW_SECONDS`. Routes without rate-limit metadata are skipped by the guard; decorated routes without authenticated key metadata use the client IP as their counter identity.
+
 ## HTTP endpoints
 
 | Method   | Path                    | Authentication  | Behavior                                               |
@@ -223,7 +250,13 @@ Gateway authentication rejects missing, revoked, expired, or unknown keys with H
 | `pnpm run lint`        | Run ESLint with automatic fixes             |
 | `pnpm run format`      | Format source and tests with Prettier       |
 
-Unit tests cover the cache, Redis service, and rate limiter. The existing end-to-end test still expects a starter `/check` endpoint returning `Hello World!`, which is not implemented by the current application. It requires updating before it can validate the gateway; it also initializes the real database and Redis modules.
+Focused unit tests for the rate-limit guard and API-key creation cover per-key limits, configured defaults, route overrides, shared counters across paths, separate counters per key, HTTP 429 responses, and input validation. Run them with:
+
+```sh
+pnpm test --runInBand --runTestsByPath src/rate-limiter/rate-limiter.guard.spec.ts src/api-keys/api-keys.service.spec.ts
+```
+
+These tests mock dependencies and do not exercise a live Redis server or PostgreSQL database. Additional test files exist for the cache, Redis service, and rate-limiter service. The existing end-to-end test still expects a starter `/check` endpoint returning `Hello World!`, which is not implemented by the current application. It requires updating before it can validate the gateway; it also initializes the real database and Redis modules.
 
 ## Project structure
 
